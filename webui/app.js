@@ -168,7 +168,7 @@ async function loadProject(name) {
     // 音声だけ置かれている状態。行が無いので、次にやることを出す。
     $("segments").innerHTML = "";
     $("emptyMsg").innerHTML =
-      "この収録はまだ文字起こしされていません。<br>ヘッダーの「文字起こし」から実行できます。";
+      "この収録はまだ文字起こしされていません。<br>ヘッダーの「2. 文字起こし」から実行できます。";
     $("emptyMsg").style.display = "block";
   } else {
     $("emptyMsg").style.display = "none";
@@ -1118,6 +1118,8 @@ async function ensureCaps() {
   caps.models = j.models || [];
   caps.workspace = j.workspace || null;
   fillModels(caps.models);
+  // 手元で使うときは取り込み元から選ぶので「アップロード」ではない
+  if (!caps.upload) $("addBtn").textContent = "1. 音声を追加";
   return caps;
 }
 
@@ -1162,15 +1164,24 @@ function confirmOverwrite(title, html, opts) {
   });
 }
 
-async function openJob() {
+/** 同じダイアログを2つの入口で使う。
+ *  "add" … 1. 音声を入れる（--server ではアップロード、手元では取り込み元から選ぶ）
+ *  "run" … 2. 選んでいる収録を文字起こし・話者分離する */
+let jobMode = "run";
+
+async function openJob(mode) {
   if (!(await ensureCaps())) return;   // サーバーが古い等。toast 済み
+  jobMode = mode === "add" ? "add" : "run";
+  const adding = jobMode === "add";
+  $("jobTitle").textContent = adding ? $("addBtn").textContent : "2. 文字起こし・話者分離";
   $("jobOverlay").hidden = false;
   // --server では、サーバーの中のフォルダは見せない。ブラウザから上げてもらう
-  $("jobAdd").hidden = !caps.sources;
-  $("jobUpload").hidden = !caps.upload;
+  $("jobAdd").hidden = !(adding && caps.sources);
+  $("jobUpload").hidden = !(adding && caps.upload);
+  $("jobStart").hidden = adding;
   renderWorkspace();
   setJobTarget(state && state.has_audio ? state.name : null);
-  if (caps.sources) {
+  if (adding && caps.sources) {
     $("jobSourceDir").value = $("jobSourceDir").value || caps.source_dir || "";
     await loadSources();
   }
@@ -1180,7 +1191,7 @@ async function openJob() {
 /** --server の作業場所の案内（URL と、いつ消えるか）。 */
 function renderWorkspace() {
   const w = caps.workspace;
-  $("jobWorkspace").hidden = !w;
+  $("jobWorkspace").hidden = !w || jobMode !== "add";
   if (!w) return;
   $("jobWsLink").value = location.origin + w.link;
   $("jobWsKeep").textContent =
@@ -1237,10 +1248,14 @@ async function uploadAudio() {
         : "上げられませんでした");
     return;
   }
-  st.textContent = "上げました: " + j.file + "（" + (j.size / 1048576).toFixed(1) + "MB）";
+  st.textContent = "";
   $("jobFile").value = "";
+  toast("上げました: " + j.file + "（" + (j.size / 1048576).toFixed(1) + "MB）");
   await loadProjectList();
-  setJobTarget(j.name);
+  // 上げた収録を開いて、そのまま「2. 文字起こし」へ進める
+  await loadProject(j.name);
+  $("projectSel").value = j.name;
+  await openJob("run");
 }
 
 function closeJob() {
@@ -1302,16 +1317,23 @@ async function addSource(dir, file, mode) {
   if (!j.ok) { toast("追加できませんでした"); return; }
   toast("追加しました: " + j.file);
   await loadProjectList();
-  await loadSources();
-  setJobTarget(j.name);
+  await loadProject(j.name);
+  $("projectSel").value = j.name;
+  await openJob("run");
 }
 
 /** 処理の対象を決め、チェックボックスの初期状態をその収録の状況で決める。 */
 async function setJobTarget(name) {
   jobTarget = name;
   jobProject = null;
-  $("jobRun").hidden = !name;
-  if (!name) { $("jobNote").textContent = caps.upload ? "上げる音声を選んでください。" : "追加する音声を選んでください。"; return; }
+  $("jobRun").hidden = !name || jobMode === "add";
+  if (jobMode === "add") { $("jobNote").textContent = ""; if (!name) return; }
+  if (!name) {
+    $("jobNote").textContent = "先に「" + $("addBtn").textContent + "」で音声を入れてください。";
+    $("jobStart").hidden = true;
+    return;
+  }
+  $("jobStart").hidden = jobMode === "add";
 
   const r = await fetch("/api/project?name=" + encodeURIComponent(name));
   const p = r.ok ? await r.json() : {};
@@ -1427,7 +1449,7 @@ async function offerAssign(j) {
     "話者分離が終わりました。<strong>全行に話者を割り当てますか。</strong>" +
     (labeled ? "<ul><li>いま話者が付いている " + labeled +
                "行は、分離の結果で置き換わります（⌘Z で戻せます）</li></ul>"
-             : "<ul><li>割り当てたあと、誰がどの話者かを「話者を登録」で照合します</li></ul>");
+             : "<ul><li>割り当てたあと、誰がどの話者かを「4. 話者を登録」で照合します</li></ul>");
   const ok = await confirmOverwrite("話者を割り当てますか", body,
     { allowKeepBoth: false, overwriteLabel: "割り当てる",
       cancelLabel: "あとで", danger: false });
@@ -1452,7 +1474,7 @@ function renderJobBadge(j) {
     btn.textContent = (cur ? cur.label : "処理") + "中… " + fmtDur(j.elapsed);
     btn.title = j.name + " を処理しています。押すと進捗を見られます";
   } else {
-    btn.textContent = "文字起こし";
+    btn.textContent = "2. 文字起こし";
     btn.title = "音声を追加して、文字起こしと話者分離を回す";
   }
 }
@@ -1496,7 +1518,8 @@ function renderJob(j) {
                   '<div class="log">' + (j.log || []).slice(-4).join("\n") + "</div>";
 }
 
-$("jobBtn").addEventListener("click", openJob);
+$("jobBtn").addEventListener("click", () => openJob("run"));
+$("addBtn").addEventListener("click", () => openJob("add"));
 $("jobClose").addEventListener("click", closeJob);
 $("jobStart").addEventListener("click", startJob);
 $("jobBrowse").addEventListener("click", loadSources);

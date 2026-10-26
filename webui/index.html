@@ -34,9 +34,11 @@
   <input type="range" id="seekbar" class="seekbar" min="0" max="1000" value="0" step="1" title="再生位置（ドラッグでシーク）">
 
   <div class="group">
-    <button id="jobBtn" title="音声を追加して、文字起こしと話者分離を回す">文字起こし</button>
-    <button id="rolesBtn" title="話者の人数と名前をまとめて編集する">話者を登録</button>
-    <button id="diarBtn" title="話者分離の結果を読み込んで自動で割り当てる">話者を読み込む</button>
+    <!-- 使う順に番号を振る（1→4） -->
+    <button id="addBtn" title="音声を追加する">1. アップロード</button>
+    <button id="jobBtn" title="選んでいる収録を文字起こし・話者分離する">2. 文字起こし</button>
+    <button id="diarBtn" title="話者分離の結果を読み込んで自動で割り当てる">3. 話者を読み込む</button>
+    <button id="rolesBtn" title="話者の人数と名前をまとめて編集する">4. 話者を登録</button>
   </div>
 
   <div id="roles" class="group"></div>
@@ -104,7 +106,7 @@
       各行に話者を割り当てます。行ごとに<strong>重なった時間で重み付けした多数決</strong>で
       1人に決めます（日本語は1文字ずつ話者が付くため、そのままでは細かく揺れるので）。
       2位と僅差だった行には印を付けます。<br>
-      <strong>誰がどの話者かの照合は、割り当てたあとに「話者を登録」で行います。</strong>
+      <strong>誰がどの話者かの照合は、割り当てたあとに「4. 話者を登録」で行います。</strong>
       発話行数が手がかりになります。一度名前を付けておけば、読み込み直しても引き継がれます。
     </p>
     <div id="diarBody" class="repl-rows"></div>
@@ -118,7 +120,7 @@
 <div id="jobOverlay" class="overlay" hidden>
   <div class="panel">
     <div class="panel-head">
-      <h2>文字起こし・話者分離</h2>
+      <h2 id="jobTitle">文字起こし・話者分離</h2>
       <button id="jobClose" style="margin-left:auto">閉じる</button>
     </div>
 
