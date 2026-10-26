@@ -1441,7 +1441,10 @@ function renderJobBadge(j) {
   const btn = $("jobBtn");
   const running = jobActive(j);
   btn.classList.toggle("running", !!running);
-  if (j && j.status === "queued") {
+  if (j && j.status === "queued" && j.gpu_wait) {
+    btn.textContent = "GPU の空き待ち";
+    btn.title = "ほかの計算が GPU を使っています。空いたら自動で始まります";
+  } else if (j && j.status === "queued") {
     btn.textContent = "順番待ち（前に " + j.ahead + " 件）";
     btn.title = "ほかの人の処理が終わると始まります。ページを閉じても進みます";
   } else if (running) {
@@ -1469,6 +1472,14 @@ function renderJob(j) {
     (s.status === "running" ? "（実行中）" : "") +
     (s.estimate ? " <span class='muted-sm'>約 " + fmtDur(s.estimate) + "</span>" : "") +
     "</div>").join("");
+  if (j.status === "queued" && j.gpu_wait) {
+    const g = j.gpu_wait;
+    box.innerHTML = "<div><strong>GPU が空くのを待っています</strong></div>" +
+      "<p class='muted-sm'>ほかの計算が GPU を使っています（使用 " + (g.used / 1024).toFixed(1) +
+      " / " + (g.total / 1024).toFixed(1) + " GB）。" + (g.need / 1024).toFixed(0) +
+      " GB 空いたら自動で始まります。このページを閉じても止まりません。</p>";
+    return;
+  }
   if (j.status === "queued") {
     box.innerHTML = "<div><strong>順番待ち（前に " + j.ahead + " 件）</strong></div>" +
       "<p class='muted-sm'>GPU は1台なので、ほかの人の処理が終わると始まります。" +

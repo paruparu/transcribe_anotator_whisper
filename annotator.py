@@ -722,6 +722,28 @@ class Store:
         return {"path": out, "lines": len(lines), "unlabeled": unlabeled}
 
 
+def gpu_status():
+    """NVIDIA の GPU の空き具合。nvidia-smi が無ければ None（確かめずに走らせる）。
+
+    {"used": MB, "total": MB, "free": MB, "util": %}。GPU が複数あれば
+    いちばん空いているもの。
+    """
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15, check=True).stdout
+        rows = []
+        for line in out.strip().splitlines():
+            used, total, util = [int(float(x)) for x in line.split(",")]
+            rows.append({"used": used, "total": total, "free": total - used, "util": util})
+        return max(rows, key=lambda r: r["free"]) if rows else None
+    except Exception:
+        return None
+
+
 class JobRunner:
     """文字起こし・話者分離を別プロセスで回し、進捗を持っておく。
 
@@ -737,9 +759,16 @@ class JobRunner:
     # 文字起こしはモデルごとに違うので models.json の speed を優先する。
     RATE = {"transcribe": 4.6, "diarize": 12.0}
 
-    def __init__(self, python=None, server=False):
+    GPU_RECHECK = 30    # GPU が埋まっているとき、何秒ごとに見直すか
+
+    def __init__(self, python=None, server=False, gpu_min_free_mb=0):
         self.python = python or sys.executable
         self.server = server
+        # 走らせる前に、GPU のメモリがこれだけ空いているかを一度確かめる。
+        # 学習など、ほかの人の計算が GPU を使っているときに割り込んで、
+        # 両方とも落ちる（メモリ不足）のを避けるため。0 なら確かめない。
+        self.gpu_min_free_mb = gpu_min_free_mb
+        self.gpu_wait = None   # 待っているあいだの GPU の様子（画面に出す）
         self.lock = threading.Lock()
         self.wake = threading.Condition(self.lock)
         self.jobs = {}      # key -> job
@@ -765,6 +794,9 @@ class JobRunner:
                 # 前に何件あるか（いま走っている1件を含む）
                 running = sum(1 for j in self.jobs.values() if j["status"] == "running")
                 out["ahead"] = self.queue.index(key) + running
+                # 列の先頭なのに始まらないのは、GPU が埋まっているから
+                if self.gpu_wait and out["ahead"] == 0:
+                    out["gpu_wait"] = dict(self.gpu_wait)
             return out
 
     def active_keys(self):
@@ -812,11 +844,39 @@ class JobRunner:
             self.wake.notify()
         return self.snapshot(key)
 
+    def _gpu_ready(self):
+        """GPU に必要なだけの空きがあるか。確かめられないときは走らせる。"""
+        if not self.gpu_min_free_mb:
+            return True
+        g = gpu_status()
+        if g is None or g["free"] >= self.gpu_min_free_mb:
+            with self.lock:
+                self.gpu_wait = None
+            return True
+        with self.lock:
+            self.gpu_wait = {"used": g["used"], "total": g["total"], "util": g["util"],
+                             "need": self.gpu_min_free_mb, "checked": time.time()}
+        return False
+
     def _worker(self):
+        logged = False
         while True:
             with self.lock:
                 while not self.queue:
                     self.wake.wait()
+            # 列から取り出す前に、GPU が空いているかを一度確かめる
+            if not self._gpu_ready():
+                if not logged:
+                    w = self.gpu_wait
+                    print("GPU が埋まっているので待ちます（使用 %d / %d MB・必要な空き %d MB）"
+                          % (w["used"], w["total"], w["need"]), flush=True)
+                    logged = True
+                time.sleep(self.GPU_RECHECK)
+                continue
+            logged = False
+            with self.lock:
+                if not self.queue:
+                    continue
                 key = self.queue.pop(0)
                 job = self.jobs.get(key)
                 if not job:
@@ -1362,12 +1422,16 @@ def main():
                              help="最後に使ってからこの日数で作業場所を消す（既定: 7）")
     server_opts.add_argument("--max-upload-mb", type=int, default=4096,
                              help="アップロードできる1ファイルの上限（MB・既定: 4096）")
+    server_opts.add_argument("--gpu-min-free-mb", type=int, default=8000,
+                             help="文字起こしを始める前に、GPU のメモリがこれだけ空いているか確かめる。"
+                                  "足りなければ空くまで待つ（--server のとき・既定: 8000。0 で確かめない）")
     parser.add_argument("--worker-python", default=sys.executable,
                         help="文字起こし・話者分離を走らせる Python（既定: このプロセスと同じ）")
     args = parser.parse_args()
 
     Handler.caps = capabilities(args.worker_python, server=args.server)
-    Handler.jobs = JobRunner(args.worker_python, server=args.server)
+    Handler.jobs = JobRunner(args.worker_python, server=args.server,
+                             gpu_min_free_mb=args.gpu_min_free_mb if args.server else 0)
     if args.server:
         Handler.workspaces = Workspaces(args.data_root, args.keep_days, DEFAULT_REPLACEMENTS)
         Handler.max_upload = args.max_upload_mb * 1024 * 1024
