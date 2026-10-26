@@ -866,7 +866,10 @@ class JobRunner:
             # ライブラリの警告は画面に出さない。pyannote が毎回吐く
             # RuntimeWarning などで、進捗の表示が埋まってしまうため。
             noise = ("Warning:" in line or line.startswith(("Fetching ", "  ", "\t"))
-                     or "warnings.warn" in line or line.startswith("/"))
+                     or "warnings.warn" in line or line.startswith("/")
+                     # pyannote が TF32 を切ったと毎回知らせてくる（CUDA のとき）
+                     or line.startswith(("It can be re-enabled", "See https://github.com/pyannote"))
+                     or "TensorFloat-32" in line)
             if line and not noise:
                 # --server では、サーバーの中のパスを画面に出さない
                 if self.server:
