@@ -1120,6 +1120,12 @@ async function ensureCaps() {
   fillModels(caps.models);
   // 手元で使うときは取り込み元から選ぶので「アップロード」ではない
   if (!caps.upload) $("addBtn").textContent = "1. 音声を追加";
+  if (caps.workspace) {
+    $("keepBanner").textContent =
+      "⚠ 最後に使ってから " + caps.workspace.keep_days + " 日たつと、この作業場所のデータ（音声・文字起こし・アノテーション）はすべて消えます。" +
+      "終わったら「書き出し」でダウンロードして、手元に保存してください。";
+    $("keepBanner").hidden = false;
+  }
   return caps;
 }
 
