@@ -336,4 +336,4 @@ button.danger { background: #c0392b; color: #fff; border-color: #c0392b; }
 
 /* --server：作業場所の案内 */
 .job-workspace { border: 1px solid var(--line, #ddd); border-radius: 8px; padding: 8px 10px; margin-bottom: 12px; }
-.job-workspace .dir-input { flex: 1; }
+.job-workspace .group { display: flex; align-items: center; gap: 8px; }
