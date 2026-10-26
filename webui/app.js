@@ -1121,8 +1121,9 @@ async function ensureCaps() {
   // 手元で使うときは取り込み元から選ぶので「アップロード」ではない
   if (!caps.upload) $("addBtn").textContent = "1. 音声を追加";
   if (caps.workspace) {
+    loadWorkspaces();
     $("keepBanner").textContent =
-      "⚠ 最後に使ってから " + caps.workspace.keep_days + " 日たつと、この作業場所のデータ（音声・文字起こし・アノテーション）はすべて消えます。" +
+      "⚠ 最後に使ってから " + caps.workspace.keep_days + " 日たつと、その作業場所のデータ（音声・文字起こし・アノテーション）はすべて消えます。" +
       "終わったら「書き出し」でダウンロードして、手元に保存してください。";
     $("keepBanner").hidden = false;
   }
@@ -1193,6 +1194,71 @@ async function openJob(mode) {
   }
   await pollJob();          // 走っている最中に開いたら進捗を出す
 }
+
+// ------------------------------------------------------------------ 作業場所（--server）
+// 研究ごとに作業場所を分けて使う。どの作業場所を知っているかはこのブラウザが
+// 覚えておく（サーバーは ID を知らない人に一覧を見せない）。切り替えは
+// /?ws=<ID> を開き直すだけ（cookie が切り替わる）。
+const WS_KEY = "annotator.workspaces";
+
+function knownWorkspaces() {
+  try { return JSON.parse(localStorage.getItem(WS_KEY) || "[]"); } catch (e) { return []; }
+}
+function saveKnown(ids) {
+  try { localStorage.setItem(WS_KEY, JSON.stringify(ids)); } catch (e) {}
+}
+
+async function loadWorkspaces() {
+  const cur = caps.workspace;
+  let ids = knownWorkspaces().filter((x) => x !== cur.id);
+  ids.unshift(cur.id);
+  const j = await (await fetch("/api/workspaces?ids=" + ids.join(","))).json();
+  const alive = j.workspaces || [];
+  saveKnown(alive.map((w) => w.id));     // 消えた作業場所は忘れる
+  const sel = $("wsSel");
+  sel.innerHTML = "";
+  for (const w of alive) {
+    const o = document.createElement("option");
+    o.value = w.id;
+    o.textContent = "📁 " + w.name;
+    sel.appendChild(o);
+  }
+  for (const [v, t] of [["__new", "＋ 新しい作業場所を作る…"], ["__rename", "✎ この作業場所の名前を変える…"]]) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = t;
+    sel.appendChild(o);
+  }
+  sel.value = cur.id;
+  sel.hidden = false;
+}
+
+$("wsSel").addEventListener("change", async (e) => {
+  const v = e.target.value;
+  const cur = caps.workspace;
+  e.target.value = cur.id;               // 選んだ瞬間は戻しておく（やめたとき用）
+  if (v === "__new") {
+    const name = window.prompt("新しい作業場所の名前（研究の名前など）", "");
+    if (name === null) return;
+    if (dirty) await doSave();
+    const j = await (await fetch("/api/workspace/new", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }) })).json();
+    if (!j.ok) { toast("作れませんでした"); return; }
+    saveKnown([j.id, ...knownWorkspaces()]);
+    location.href = j.link;
+  } else if (v === "__rename") {
+    const name = window.prompt("この作業場所の名前", cur.name);
+    if (name === null) return;
+    const j = await (await fetch("/api/workspace/rename", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }) })).json();
+    cur.name = j.name;
+    await loadWorkspaces();
+  } else if (v !== cur.id) {
+    if (dirty) await doSave();
+    location.href = "/?ws=" + encodeURIComponent(v);
+  }
+});
 
 /** --server の作業場所の案内（URL と、いつ消えるか）。 */
 function renderWorkspace() {

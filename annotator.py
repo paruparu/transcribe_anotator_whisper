@@ -978,16 +978,44 @@ class Workspaces:
     def exists(self, wid):
         return bool(wid) and bool(WORKSPACE_RE.match(wid)) and os.path.isdir(self.path(wid))
 
-    def create(self):
+    def create(self, name=None):
         wid = secrets.token_urlsafe(18)
         d = self.path(wid)
         os.makedirs(d)
+        self.rename(wid, name or "作業場所")
         # 置換辞書は作業場所ごと。ほかの人の固有名詞が混ざらないように
         dst = os.path.join(d, "replacements.json")
         if os.path.exists(self.template):
             shutil.copyfile(self.template, dst)
         self.touch(wid, force=True)
         return wid
+
+    # 作業場所の名前（研究ごとに分けて使うときの見分け）。中身は .meta.json
+    def name(self, wid):
+        try:
+            with open(os.path.join(self.path(wid), ".meta.json"), encoding="utf-8") as f:
+                return json.load(f).get("name") or "作業場所"
+        except (OSError, ValueError):
+            return "作業場所"
+
+    def rename(self, wid, name):
+        name = " ".join((name or "").split())[:40] or "作業場所"
+        path = os.path.join(self.path(wid), ".meta.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"name": name}, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+        return name
+
+    def describe(self, wids):
+        """ブラウザが知っている作業場所のうち、まだあるものの名前と最終利用。
+
+        ID を知らないものは返さない（一覧をのぞけないように）。"""
+        out = []
+        for wid in wids:
+            if self.exists(wid):
+                out.append({"id": wid, "name": self.name(wid),
+                            "last_used": round(self.last_used(wid))})
+        return out
 
     def store(self, wid):
         d = self.path(wid)
@@ -1269,7 +1297,8 @@ class Handler(BaseHTTPRequestHandler):
             body = {"capabilities": self.caps, "models": load_models(self.jobs.model_kind()),
                     "source_dir": "" if server else self.source_dir}
             if server:
-                body["workspace"] = {"link": "/?ws=" + self.wid,
+                body["workspace"] = {"link": "/?ws=" + self.wid, "id": self.wid,
+                                     "name": self.workspaces.name(self.wid),
                                      "keep_days": self.workspaces.keep_days,
                                      "max_upload": self.max_upload}
             self._send_json(body)
@@ -1287,6 +1316,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"name": name, "artifacts": self.st.artifacts(name)})
         elif path == "/api/job":
             self._send_json({"job": self.jobs.snapshot(self.wid)})
+        elif path == "/api/workspaces" and server:
+            ids = [x for x in (qs.get("ids") or [""])[0].split(",") if x][:50]
+            self._send_json({"current": self.wid,
+                             "workspaces": self.workspaces.describe(ids)})
         elif path == "/api/download" and server:
             self._serve_download((qs.get("name") or [""])[0], (qs.get("kind") or [""])[0])
         elif path == "/audio":
@@ -1313,6 +1346,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         server = bool(self.workspaces)
 
+        if path == "/api/workspace/new" and server:
+            # 新しい作業場所を作る。切り替えは画面が /?ws=<ID> を開いて行う
+            body = self._read_body() or {}
+            wid = self.workspaces.create(body.get("name"))
+            self._send_json({"ok": True, "id": wid, "name": self.workspaces.name(wid),
+                             "link": "/?ws=" + wid})
+            return
+        if path == "/api/workspace/rename" and server:
+            body = self._read_body() or {}
+            self._send_json({"ok": True, "name": self.workspaces.rename(self.wid, body.get("name"))})
+            return
         if path == "/api/upload" and server:
             length = int(self.headers.get("Content-Length", 0) or 0)
             if length <= 0:
