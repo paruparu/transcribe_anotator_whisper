@@ -122,6 +122,31 @@
       <button id="jobClose" style="margin-left:auto">閉じる</button>
     </div>
 
+    <div id="jobWorkspace" class="job-workspace" hidden>
+      <p class="muted-sm">
+        ここは<strong>あなた専用の作業場所</strong>です。ほかの人の収録は見えません。
+        別の端末から続けるときは、この URL を開いてください（人には教えないでください）。
+      </p>
+      <div class="group" style="padding:4px 0 0">
+        <input type="text" id="jobWsLink" class="dir-input" readonly spellcheck="false">
+        <button id="jobWsCopy">コピー</button>
+      </div>
+      <p class="muted-sm" id="jobWsKeep"></p>
+    </div>
+
+    <div id="jobUpload" hidden>
+      <h3 class="panel-sub">音声を上げる</h3>
+      <p class="muted-sm">
+        手元の音声（m4a・mp3・wav・mp4 など）を選ぶと、この作業場所に上がります。
+        同じ名前が既にあるときは、上書きするか両方残すかを聞きます。
+      </p>
+      <div class="group" style="padding:0 0 8px">
+        <input type="file" id="jobFile" accept=".wav,.mp3,.m4a,.flac,.ogg,.aac,.mp4,audio/*">
+        <button id="jobUploadBtn">上げる</button>
+      </div>
+      <div id="jobUploadState" class="muted-sm"></div>
+    </div>
+
     <div id="jobAdd">
       <h3 class="panel-sub">ファイルを追加</h3>
       <p class="muted-sm">

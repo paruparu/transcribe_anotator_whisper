@@ -58,6 +58,7 @@ python annotator.py --source-dir ~/Documents/録音   # よく音声を置く場
 | 同じ誤変換をまとめて直す | [置換辞書](#置換辞書同じ誤変換をまとめて直す) |
 | 作業を他の人に引き継ぐ | [別の端末に渡して続きをやってもらう](#別の端末に渡して続きをやってもらう) |
 | 文字起こしは使わず注釈だけ | [アノテーションだけで使う](#アノテーションだけで使う) |
+| 研究室の GPU 機でみんなに使ってもらう | [研究室のサーバーで共有する](#研究室のサーバーで共有する--server) |
 | うまくいかない | [困ったとき](#困ったとき) |
 
 ---
@@ -641,6 +642,35 @@ python annotator.py
 
 ---
 
+## 研究室のサーバーで共有する（`--server`）
+
+GPU 機で1つ立てておき、**LAN にいる人がブラウザから音声を上げて、文字起こし・話者分離・アノテーションまでできる**ようにする形です。
+手元で使うとき（`--server` なし）の動き方は変わりません。
+
+```bash
+python annotator.py --server --host 0.0.0.0 --port 28630 \
+    --data-root ~/transcribe-workspaces \
+    --worker-python ~/tool/whisperX/.venv/bin/python   # faster-whisper と pyannote.audio が入った Python
+```
+
+| | 手元（既定） | `--server` |
+|---|---|---|
+| 音声の入れ方 | 取り込み元のフォルダから選ぶ | **ブラウザから上げる**（サーバーの中のフォルダは見せない） |
+| 収録の一覧 | `recordings/` を全部 | **人ごとの作業場所**。ほかの人の収録は見えない |
+| 文字起こし | `transcribe_mlx.py`（Apple GPU） | `transcribe_cuda.py`（NVIDIA GPU・faster-whisper large-v3） |
+| 置換辞書 | リポジトリの `replacements.json` | 作業場所ごと（最初はリポジトリのものの写し） |
+| 書き出し | `recordings/` に置く | 置いたうえで、手元に落とす |
+| 片付け | しない | **最後に使ってから `--keep-days` 日（既定 7）で作業場所ごと消す** |
+
+- **作業場所**は `--data-root/<推測できない ID>/`。初めて開いたブラウザに作り、cookie で覚えてもらいます。
+  文字起こしの画面にその作業場所の URL（`/?ws=<ID>`）が出るので、別の端末からはそれを開けば続きができます。
+  **ログインは無く、ID を知っていれば誰でも開けます。**LAN の中だけで使い、URL は人に教えないでください
+- **GPU は全員で1本ずつ。**ほかの人の処理が動いていれば順番待ちになり、画面に「前に何件」が出ます。ページを閉じても止まりません。1つの作業場所で同時に走らせられるのは1件だけです
+- 消すのは1時間ごとの見回りです。処理中・順番待ちの作業場所は消しません
+- アップロードの上限は `--max-upload-mb`（既定 4096）
+- 文字起こしのモデルは `models.json` の `transcribe_cuda` に並べたものから選びます。
+  初期プロンプトは句読点入りの文で、書き方を誘導しています（`transcribe_cuda.py` の説明を参照）
+
 ## 困ったとき
 
 ### 「文字起こし」を押しても何も起きない
@@ -724,6 +754,7 @@ pkill -f annotator.py                 # 落とす
 ```
 transcribe.py            文字起こしスクリプト（faster-whisper / CPU・CUDA）
 transcribe_mlx.py        文字起こしスクリプト（MLX / Apple GPU。Mac ならこちら）
+transcribe_cuda.py       文字起こしスクリプト（faster-whisper / NVIDIA GPU。--server が使う）
 diarize_local.py         話者分離だけをローカルで行う（pyannote のみ・32MB）
 import_whisper.py        外で作った文字起こし（JSON/SRT）を recordings/ に取り込む
 diarize_d1.py            推奨の話者分離パイプライン（本文を変えずに話者を足す）
@@ -733,4 +764,5 @@ replacements.json        置換辞書（誤→正。git管理して共有する�
 models.json              画面で選べる文字起こしモデルの一覧（同上）
 model/                   Whisperモデル（.gitignore）
 recordings/              音声・文字起こし・アノテーション（.gitignore）
+workspaces/              --server の作業場所の既定の置き場（.gitignore）
 ```

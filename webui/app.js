@@ -644,6 +644,9 @@ $("exportBtn").addEventListener("click", async () => {
     let msg = "書き出しました: " + j.path.split("/").pop() + "（" + j.lines + "行）";
     if (j.unlabeled) msg += " ／ 未ラベル " + j.unlabeled + " 行は (未設定) で出力";
     toast(msg);
+    // --server では、書き出したものはサーバーにあるので手元に落とす
+    if (caps && caps.download)
+      location.href = "/api/download?kind=annotated&name=" + encodeURIComponent(state.name);
   } else toast("書き出し失敗");
 });
 
@@ -1108,8 +1111,12 @@ async function ensureCaps() {
     return null;
   }
   caps = j.capabilities || {};
+  // 古いサーバーは transcribe_mlx しか返さない
+  if (caps.transcribe === undefined) caps.transcribe = !!caps.transcribe_mlx;
+  if (caps.sources === undefined) caps.sources = true;
   caps.source_dir = j.source_dir || "";
   caps.models = j.models || [];
+  caps.workspace = j.workspace || null;
   fillModels(caps.models);
   return caps;
 }
@@ -1158,10 +1165,82 @@ function confirmOverwrite(title, html, opts) {
 async function openJob() {
   if (!(await ensureCaps())) return;   // サーバーが古い等。toast 済み
   $("jobOverlay").hidden = false;
-  $("jobSourceDir").value = $("jobSourceDir").value || caps.source_dir || "";
+  // --server では、サーバーの中のフォルダは見せない。ブラウザから上げてもらう
+  $("jobAdd").hidden = !caps.sources;
+  $("jobUpload").hidden = !caps.upload;
+  renderWorkspace();
   setJobTarget(state && state.has_audio ? state.name : null);
-  await loadSources();
+  if (caps.sources) {
+    $("jobSourceDir").value = $("jobSourceDir").value || caps.source_dir || "";
+    await loadSources();
+  }
   await pollJob();          // 走っている最中に開いたら進捗を出す
+}
+
+/** --server の作業場所の案内（URL と、いつ消えるか）。 */
+function renderWorkspace() {
+  const w = caps.workspace;
+  $("jobWorkspace").hidden = !w;
+  if (!w) return;
+  $("jobWsLink").value = location.origin + w.link;
+  $("jobWsKeep").textContent =
+    "最後に使ってから " + w.keep_days + " 日たつと、音声も文字起こしも消えます。" +
+    "書き出したテキストは手元に保存してください。";
+}
+
+/** 音声を上げる（--server）。同名があれば先に聞いてから送る。
+ *  送りかけてから断られると、大きいファイルほど待たされるため。 */
+async function uploadAudio() {
+  const f = $("jobFile").files[0];
+  if (!f) { toast("音声を選んでください"); return; }
+  const max = (caps.workspace && caps.workspace.max_upload) || 0;
+  if (max && f.size > max) {
+    toast("大きすぎます（上限 " + Math.round(max / 1048576) + "MB）");
+    return;
+  }
+  const stem = f.name.replace(/\.[^.]+$/, "");
+  let mode = "ask";
+  const list = await (await fetch("/api/list")).json();
+  const same = (list.projects || []).find((p) => p.name === stem && p.audio);
+  if (same) {
+    const a = (await (await fetch("/api/artifacts?name=" + encodeURIComponent(stem))).json()).artifacts || [];
+    const items = a.map((x) => "<li>" + x.label + "：" + x.file + "</li>").join("");
+    mode = await confirmOverwrite(
+      "同じ名前の収録があります",
+      "<strong>" + stem + "</strong> は既に上がっています。<br>" +
+      "上書きすると、下のものが消えます。" +
+      (items ? "<ul>" + items + "</ul>" : "<ul><li>音声のみ</li></ul>"),
+      { allowKeepBoth: true });
+    if (!mode) return;
+  }
+
+  const btn = $("jobUploadBtn"), st = $("jobUploadState");
+  btn.disabled = true;
+  const j = await new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload?file=" + encodeURIComponent(f.name) + "&mode=" + mode);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable)
+        st.textContent = "上げています… " + Math.round(100 * e.loaded / e.total) + "%" +
+                         "（" + (e.loaded / 1048576).toFixed(0) + " / " + (e.total / 1048576).toFixed(0) + "MB）";
+    };
+    xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)); } catch (e) { resolve({}); } };
+    xhr.onerror = () => resolve({ error: "network" });
+    xhr.send(f);
+  });
+  btn.disabled = false;
+  if (!j.ok) {
+    st.textContent = "";
+    toast(j.error === "bad_type" ? "この形式の音声は上げられません"
+        : j.error === "too_large" ? "大きすぎます"
+        : j.error === "network" ? "途中で切れました。もう一度上げてください"
+        : "上げられませんでした");
+    return;
+  }
+  st.textContent = "上げました: " + j.file + "（" + (j.size / 1048576).toFixed(1) + "MB）";
+  $("jobFile").value = "";
+  await loadProjectList();
+  setJobTarget(j.name);
 }
 
 function closeJob() {
@@ -1232,7 +1311,7 @@ async function setJobTarget(name) {
   jobTarget = name;
   jobProject = null;
   $("jobRun").hidden = !name;
-  if (!name) { $("jobNote").textContent = "追加する音声を選んでください。"; return; }
+  if (!name) { $("jobNote").textContent = caps.upload ? "上げる音声を選んでください。" : "追加する音声を選んでください。"; return; }
 
   const r = await fetch("/api/project?name=" + encodeURIComponent(name));
   const p = r.ok ? await r.json() : {};
@@ -1243,13 +1322,14 @@ async function setJobTarget(name) {
   // 既にあるものは既定でオフ。押した瞬間に消えるのを避ける。
   tBox.checked = !p.transcribed;
   dBox.checked = !p.diarization;
-  tBox.disabled = !caps.transcribe_mlx;
+  tBox.disabled = !caps.transcribe;
   dBox.disabled = !caps.diarize;
-  $("jobModel").disabled = !caps.transcribe_mlx;
+  $("jobModel").disabled = !caps.transcribe;
   $("jobSpeakers").disabled = !caps.diarize;
 
   const missing = [];
-  if (!caps.transcribe_mlx) missing.push("文字起こし（mlx-whisper が未導入、または Mac ではない）");
+  if (!caps.transcribe) missing.push(caps.upload ? "文字起こし（サーバーに faster-whisper が無い）"
+                                                  : "文字起こし（mlx-whisper が未導入、または Mac ではない）");
   if (!caps.diarize) missing.push("話者分離（pyannote.audio が未導入）");
   const warn = $("jobWarn");
   const notes = [];
@@ -1299,7 +1379,7 @@ async function startJob() {
   });
   const j = await res.json();
   if (!j.ok) {
-    toast(j.error === "busy" ? "別の処理が動いています: " + j.running
+    toast(j.error === "busy" ? (caps.upload ? "この作業場所の処理がまだ終わっていません: " : "別の処理が動いています: ") + j.running
         : j.error === "unknown_model" ? "models.json にないモデルです"
         : "開始できませんでした");
     return;
@@ -1308,13 +1388,16 @@ async function startJob() {
   if (!jobPoll) jobPoll = setInterval(pollJob, 2000);
 }
 
+/** 走っている・順番待ちのどちらも「まだ終わっていない」 */
+function jobActive(j) { return j && (j.status === "running" || j.status === "queued"); }
+
 async function pollJob() {
   const r = await fetch("/api/job");
   const j = (await r.json()).job;
   if (!j) { $("jobProgress").hidden = true; return; }
   renderJob(j);
-  if (j.status === "running" && !jobPoll) jobPoll = setInterval(pollJob, 2000);
-  if (j.status !== "running" && jobPoll) {
+  if (jobActive(j) && !jobPoll) jobPoll = setInterval(pollJob, 2000);
+  if (!jobActive(j) && jobPoll) {
     clearInterval(jobPoll); jobPoll = null;
     await loadProjectList();
     if (j.status === "done") {
@@ -1356,9 +1439,12 @@ async function offerAssign(j) {
 /** ヘッダーのボタンに実行中を出す。ダイアログを閉じていても分かるように。 */
 function renderJobBadge(j) {
   const btn = $("jobBtn");
-  const running = j && j.status === "running";
+  const running = jobActive(j);
   btn.classList.toggle("running", !!running);
-  if (running) {
+  if (j && j.status === "queued") {
+    btn.textContent = "順番待ち（前に " + j.ahead + " 件）";
+    btn.title = "ほかの人の処理が終わると始まります。ページを閉じても進みます";
+  } else if (running) {
     const cur = j.stages.find((s) => s.status === "running");
     btn.textContent = (cur ? cur.label : "処理") + "中… " + fmtDur(j.elapsed);
     btn.title = j.name + " を処理しています。押すと進捗を見られます";
@@ -1383,6 +1469,12 @@ function renderJob(j) {
     (s.status === "running" ? "（実行中）" : "") +
     (s.estimate ? " <span class='muted-sm'>約 " + fmtDur(s.estimate) + "</span>" : "") +
     "</div>").join("");
+  if (j.status === "queued") {
+    box.innerHTML = "<div><strong>順番待ち（前に " + j.ahead + " 件）</strong></div>" +
+      "<p class='muted-sm'>GPU は1台なので、ほかの人の処理が終わると始まります。" +
+      "このページを閉じても止まりません。</p>";
+    return;
+  }
   const bar = j.status === "running"
     ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : "";
   const head = j.status === "running"
@@ -1397,6 +1489,11 @@ $("jobBtn").addEventListener("click", openJob);
 $("jobClose").addEventListener("click", closeJob);
 $("jobStart").addEventListener("click", startJob);
 $("jobBrowse").addEventListener("click", loadSources);
+$("jobUploadBtn").addEventListener("click", uploadAudio);
+$("jobWsCopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("jobWsLink").value); toast("コピーしました"); }
+  catch (e) { $("jobWsLink").select(); toast("選択したので ⌘C でコピーしてください"); }
+});
 $("jobModel").addEventListener("change", () => {
   const m = (caps.models || []).find((x) => x.model === $("jobModel").value) || {};
   $("jobModelNote").textContent = m.note || "";
@@ -1407,3 +1504,6 @@ closeOnBackdrop("jobOverlay", closeJob);
 
 // ページを開き直しても、走っている処理を拾い直す（状態はサーバーが持っている）
 pollJob().catch(() => {});
+// 書き出しで落とすかどうかなどを先に知っておく。?ws= は cookie に移ったので消す
+ensureCaps().catch(() => {});
+if (new URLSearchParams(location.search).has("ws")) history.replaceState(null, "", "/");

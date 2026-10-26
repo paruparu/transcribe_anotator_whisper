@@ -10,7 +10,10 @@
     "note  … 画面の下に出る一行説明",
     "",
     "量子化版（-4bit / -8bit）と turbo は、日本語の固有名詞を取りこぼすので",
-    "既定では入れていない。速さが要るときだけ、承知のうえで足すこと。"
+    "既定では入れていない。速さが要るときだけ、承知のうえで足すこと。",
+    "",
+    "transcribe_cuda … annotator.py --server（NVIDIA の GPU 機）で選べるモデル。",
+    "model は faster-whisper のモデル名（large-v3 など）。初回だけ自動で落ちてくる"
   ],
   "transcribe": [
     {
@@ -18,6 +21,14 @@
       "model": "mlx-community/whisper-large-v3-mlx",
       "speed": 4.6,
       "note": "既定。固有名詞に強い。30分の音声で約6分半"
+    }
+  ],
+  "transcribe_cuda": [
+    {
+      "label": "faster-whisper large-v3（NVIDIA GPU）",
+      "model": "large-v3",
+      "speed": 20.0,
+      "note": "既定。固有名詞に強い。句読点入りの初期プロンプトで書き方を誘導する"
     }
   ]
 }

@@ -13,6 +13,10 @@ faster-whisper で生成した `[開始s -> 終了s] テキスト` 形式のタ�
     python annotator.py            # recordings/ を対象に http://127.0.0.1:8000 で起動
     python annotator.py --dir some_dir --port 8000
 
+研究室の GPU 機で、LAN のみんなに使ってもらうときは --server を付ける
+（README の「研究室のサーバーで共有する」）。人ごとに作業場所が分かれ、
+音声はブラウザから上げ、使われなくなった作業場所は日数で消える。
+
 置換辞書はリポジトリ直下の replacements.json（--replacements で変更可）。
 
 状態は各収録ごとに recordings/<name>.annot.json に自動保存されるため、
@@ -25,6 +29,7 @@ import bisect
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -46,6 +51,9 @@ DEFAULT_REPLACEMENTS = os.path.join(BASE_DIR, "replacements.json")
 MODELS_PATH = os.path.join(BASE_DIR, "models.json")
 
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".mp4")
+
+# --server のときの作業場所の ID。推測されないことだけが鍵なので、短くしない。
+WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{22,64}$")
 DEFAULT_ROLES = ["インタビュアー", "インタビュイー"]
 
 # "[12.34s -> 56.78s] テキスト" にマッチ
@@ -87,15 +95,20 @@ def probe_duration(path):
 DEFAULT_MODELS = [{"label": "MLX large-v3（Apple GPU）",
                    "model": "mlx-community/whisper-large-v3-mlx",
                    "speed": 4.6, "note": ""}]
+DEFAULT_CUDA_MODELS = [{"label": "faster-whisper large-v3（NVIDIA GPU）",
+                        "model": "large-v3", "speed": 20.0, "note": ""}]
 
 
-def load_models():
-    """models.json を読む。壊れていても既定に落ちて動き続ける。"""
+def load_models(kind="transcribe"):
+    """models.json を読む。壊れていても既定に落ちて動き続ける。
+
+    kind は "transcribe"（Mac の MLX）か "transcribe_cuda"（--server の GPU 機）。
+    """
     try:
         with open(MODELS_PATH, encoding="utf-8") as f:
             data = json.load(f)
         rows = []
-        for m in data.get("transcribe", []):
+        for m in data.get(kind, []):
             model = (m.get("model") or "").strip()
             if not model:
                 continue
@@ -103,35 +116,52 @@ def load_models():
                          "model": model,
                          "speed": float(m.get("speed") or 4.6),
                          "note": m.get("note") or ""})
-        return rows or list(DEFAULT_MODELS)
+        return rows or list(DEFAULT_MODELS if kind == "transcribe" else DEFAULT_CUDA_MODELS)
     except Exception:
-        return list(DEFAULT_MODELS)
+        return list(DEFAULT_MODELS if kind == "transcribe" else DEFAULT_CUDA_MODELS)
 
 
-def capabilities():
+def capabilities(python=None, server=False):
     """この環境で何ができるかを調べる。
 
     アノテーターは標準ライブラリだけで動くので、文字起こしも話者分離も
     「無ければ無いなりに」動かす。UI 側はここを見て、使えない機能を
     押せなくする（押してから失敗するのが一番たちが悪い）。
+
+    python は文字起こし・話者分離を走らせる Python（--worker-python）。
+    アノテーター本体とは別の仮想環境に重いライブラリを入れておけるように。
     """
+    python = python or sys.executable
+
     def importable(mod):
         try:
-            subprocess.run([sys.executable, "-c", "import " + mod],
+            subprocess.run([python, "-c", "import " + mod],
                            capture_output=True, timeout=60, check=True)
             return True
         except Exception:
             return False
 
-    caps = {
-        "transcribe_mlx": (sys.platform == "darwin"
-                           and os.path.exists(os.path.join(BASE_DIR, "transcribe_mlx.py"))
-                           and importable("mlx_whisper")),
-        "diarize": (os.path.exists(os.path.join(BASE_DIR, "diarize_local.py"))
-                    and importable("pyannote.audio")),
+    diarize = (os.path.exists(os.path.join(BASE_DIR, "diarize_local.py"))
+               and importable("pyannote.audio"))
+    if server:
+        # GPU 機。音声はブラウザから上げてもらい、サーバーの中は見せない。
+        return {
+            "transcribe": (os.path.exists(os.path.join(BASE_DIR, "transcribe_cuda.py"))
+                           and importable("faster_whisper")),
+            "diarize": diarize,
+            "ffprobe": bool(shutil.which("ffprobe")),
+            "upload": True, "sources": False, "download": True,
+        }
+    mlx = (sys.platform == "darwin"
+           and os.path.exists(os.path.join(BASE_DIR, "transcribe_mlx.py"))
+           and importable("mlx_whisper"))
+    return {
+        "transcribe": mlx,
+        "transcribe_mlx": mlx,
+        "diarize": diarize,
         "ffprobe": bool(shutil.which("ffprobe")),
+        "upload": False, "sources": True, "download": False,
     }
-    return caps
 
 
 class Store:
@@ -235,27 +265,96 @@ class Store:
             return {"error": "not_found"}
 
         stem, ext = os.path.splitext(filename)
-        dest_name = stem
-        if self._find_audio(stem):
-            if mode == "ask":
-                return {"error": "exists", "name": stem,
-                        "artifacts": self.artifacts(stem)}
-            if mode == "keep_both":
-                i = 2
-                while self._find_audio("%s-%d" % (stem, i)):
-                    i += 1
-                dest_name = "%s-%d" % (stem, i)
-            elif mode != "overwrite":
-                return {"error": "bad_mode"}
+        dest_name, err = self._dest_name(stem, mode)
+        if err:
+            return err
 
         dest = os.path.join(self.data_dir, dest_name + ext)
         os.makedirs(self.data_dir, exist_ok=True)
         tmp = dest + ".part"
         with open(src, "rb") as fin, open(tmp, "wb") as fout:
             shutil.copyfileobj(fin, fout, 1024 * 1024)
-        os.replace(tmp, dest)   # 途中で落ちても半端なファイルが残らない
+        self._replace_audio(dest_name, tmp, dest)
         return {"name": dest_name, "file": os.path.basename(dest),
                 "size": os.path.getsize(dest)}
+
+    def _dest_name(self, stem, mode):
+        """同名があるときの扱いを決める。(保存する名前, エラー) を返す。
+
+        mode は "ask"（既定・衝突したら何もせず知らせる）/ "overwrite" /
+        "keep_both"（連番を付けて両方残す）。黙って上書きしないための作り。
+        """
+        if not self._find_audio(stem):
+            return stem, None
+        if mode == "ask":
+            return None, {"error": "exists", "name": stem,
+                          "artifacts": self.artifacts(stem)}
+        if mode == "keep_both":
+            i = 2
+            while self._find_audio("%s-%d" % (stem, i)):
+                i += 1
+            return "%s-%d" % (stem, i), None
+        if mode != "overwrite":
+            return None, {"error": "bad_mode"}
+        return stem, None
+
+    def _replace_audio(self, name, tmp, dest):
+        """音声を置き換える。拡張子違いの古い音声が残ると、どちらを読むか
+        分からなくなるので消してから置く。"""
+        for ext in AUDIO_EXTENSIONS:
+            old = os.path.join(self.data_dir, name + ext)
+            if old != dest and os.path.exists(old):
+                os.remove(old)
+        os.replace(tmp, dest)   # 途中で落ちても半端なファイルが残らない
+
+    def add_upload(self, filename, stream, length, mode="ask"):
+        """ブラウザから上がってきた音声を保存する（--server のとき）。
+
+        multipart は使わず、本文にファイルの中身をそのまま載せてもらう
+        （fetch(…, {body: file})）。標準ライブラリだけで受けられるため。
+        """
+        filename = os.path.basename(filename or "").strip()
+        stem, ext = os.path.splitext(filename)
+        if not stem or not self._safe(filename) or stem.startswith("."):
+            return {"error": "bad_name"}
+        if ext.lower() not in AUDIO_EXTENSIONS:
+            return {"error": "bad_type"}
+        dest_name, err = self._dest_name(stem, mode)
+        if err:
+            return err
+        os.makedirs(self.data_dir, exist_ok=True)
+        dest = os.path.join(self.data_dir, dest_name + ext.lower())
+        tmp = dest + ".part"
+        remaining = length
+        try:
+            with open(tmp, "wb") as fout:
+                while remaining > 0:
+                    buf = stream.read(min(1024 * 1024, remaining))
+                    if not buf:
+                        break
+                    fout.write(buf)
+                    remaining -= len(buf)
+        except (ConnectionResetError, BrokenPipeError):
+            remaining = 1
+        if remaining:
+            # 途中で切れたものは残さない
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return {"error": "incomplete"}
+        self._replace_audio(dest_name, tmp, dest)
+        return {"name": dest_name, "file": os.path.basename(dest),
+                "size": os.path.getsize(dest)}
+
+    def download_path(self, name, kind):
+        """書き出し・文字起こしの成果物を落とすときのパス（--server のとき）。"""
+        if not self._safe(name):
+            return None
+        path = {
+            "annotated": self._export_path(name),
+            "timecoded": self._timecoded_path(name),
+            "text": os.path.join(self.data_dir, name + "_text.txt"),
+        }.get(kind)
+        return path if path and os.path.exists(path) else None
 
     def artifacts(self, name):
         """この収録について既にある成果物。上書き確認で見せる。"""
@@ -628,40 +727,65 @@ class JobRunner:
 
     状態をサーバー側に置くので、**ページを閉じて開き直しても進捗に戻れる**。
     GPU を取り合わないよう、走らせるのは一度に1本だけ。
+
+    --server のときは作業場所（key）ごとに1件まで受け付け、ほかの人の処理が
+    動いていれば順番待ちの列に並べる。ほかの人の収録の名前は返さない。
+    手元で使うとき（key は ""）は、これまでどおり動いていれば断る。
     """
 
     # 実測値（M4 / 日本語）。残り時間の目安を出すのに使う。
     # 文字起こしはモデルごとに違うので models.json の speed を優先する。
     RATE = {"transcribe": 4.6, "diarize": 12.0}
 
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, python=None, server=False):
+        self.python = python or sys.executable
+        self.server = server
         self.lock = threading.Lock()
-        self.job = None
+        self.wake = threading.Condition(self.lock)
+        self.jobs = {}      # key -> job
+        self.queue = []     # 待っている key（先頭から順に走らせる）
+        if server:
+            self.RATE = {"transcribe": 20.0, "diarize": 40.0}
+        threading.Thread(target=self._worker, daemon=True).start()
 
-    def snapshot(self):
+    def model_kind(self):
+        return "transcribe_cuda" if self.server else "transcribe"
+
+    def snapshot(self, key=""):
         with self.lock:
-            if not self.job:
+            job = self.jobs.get(key)
+            if not job:
                 return None
-            job = dict(self.job)
+            out = {k: v for k, v in job.items() if k not in ("store", "audio")}
+            out["stages"] = [dict(s) for s in job["stages"]]
             if job["status"] == "running":
                 # 文字起こしは途中で何も出力しないので、経過はここで数える
-                job["elapsed"] = round(time.time() - job["started"])
-            return job
+                out["elapsed"] = round(time.time() - job["started"])
+            if job["status"] == "queued":
+                # 前に何件あるか（いま走っている1件を含む）
+                running = sum(1 for j in self.jobs.values() if j["status"] == "running")
+                out["ahead"] = self.queue.index(key) + running
+            return out
 
-    def busy(self):
+    def active_keys(self):
         with self.lock:
-            return bool(self.job and self.job["status"] == "running")
+            return {k for k, j in self.jobs.items() if j["status"] in ("queued", "running")}
 
-    def start(self, name, do_transcribe, do_diarize, speakers, model):
-        audio = self.store._find_audio(name)
+    def forget(self, key):
+        with self.lock:
+            job = self.jobs.get(key)
+            if job and job["status"] not in ("queued", "running"):
+                del self.jobs[key]
+
+    def start(self, store, name, do_transcribe, do_diarize, speakers, model, key=""):
+        audio = store._find_audio(name)
         if not audio:
             return {"error": "no_audio"}
         stages = []
         duration = probe_duration(audio)
         if do_transcribe:
-            rate = next((m["speed"] for m in load_models() if m["model"] == model),
-                        self.RATE["transcribe"])
+            rate = next((m["speed"] for m in load_models(self.model_kind())
+                         if m["model"] == model), self.RATE["transcribe"])
             stages.append({"key": "transcribe", "label": "文字起こし", "status": "waiting",
                            "estimate": round(duration / rate) if duration else None})
         if do_diarize:
@@ -671,46 +795,68 @@ class JobRunner:
             return {"error": "nothing_to_do"}
 
         with self.lock:
-            if self.job and self.job["status"] == "running":
-                return {"error": "busy", "running": self.job["name"]}
-            self.job = {
-                "name": name, "status": "running", "stages": stages,
-                "speakers": speakers, "model": model, "started": time.time(),
-                "elapsed": 0, "current": stages[0]["key"], "log": [], "error": None,
+            mine = self.jobs.get(key)
+            if mine and mine["status"] in ("queued", "running"):
+                return {"error": "busy", "running": mine["name"]}
+            if not self.server:
+                other = next((j for j in self.jobs.values() if j["status"] == "running"), None)
+                if other:
+                    return {"error": "busy", "running": other["name"]}
+            self.jobs[key] = {
+                "name": name, "status": "queued", "stages": stages,
+                "speakers": speakers, "model": model, "queued_at": time.time(),
+                "started": None, "elapsed": 0, "current": stages[0]["key"],
+                "log": [], "error": None, "store": store, "audio": audio,
             }
-        threading.Thread(target=self._run, args=(name, audio), daemon=True).start()
-        return self.snapshot()
+            self.queue.append(key)
+            self.wake.notify()
+        return self.snapshot(key)
 
-    def _run(self, name, audio):
+    def _worker(self):
+        while True:
+            with self.lock:
+                while not self.queue:
+                    self.wake.wait()
+                key = self.queue.pop(0)
+                job = self.jobs.get(key)
+                if not job:
+                    continue
+                job["status"] = "running"
+                job["started"] = time.time()
+            self._run(key, job)
+
+    def _run(self, key, job):
         try:
-            for stage in list(self.job["stages"]):
-                self._set(current=stage["key"])
-                self._stage(stage["key"], "running")
-                cmd = self._command(stage["key"], audio)
-                code = self._spawn(cmd)
+            for stage in list(job["stages"]):
+                self._set(job, current=stage["key"])
+                self._stage(job, stage["key"], "running")
+                cmd = self._command(job, stage["key"])
+                code = self._spawn(job, cmd)
                 if code != 0:
-                    self._stage(stage["key"], "failed")
-                    self._set(status="failed",
+                    self._stage(job, stage["key"], "failed")
+                    self._set(job, status="failed",
                               error="%s に失敗しました（終了コード %d）" % (stage["label"], code))
                     return
-                self._stage(stage["key"], "done")
-            self._set(status="done")
+                self._stage(job, stage["key"], "done")
+            self._set(job, status="done")
         except Exception as e:                        # 予期しない失敗も画面に出す
-            self._set(status="failed", error=str(e))
+            self._set(job, status="failed", error=str(e))
 
-    def _command(self, key, audio):
-        python = sys.executable
+    def _command(self, job, key):
+        python = self.python
+        audio = job["audio"]
         if key == "transcribe":
-            cmd = [python, os.path.join(BASE_DIR, "transcribe_mlx.py"), audio, "--overwrite"]
-            if self.job.get("model"):
-                cmd += ["--model", self.job["model"]]
+            script = "transcribe_cuda.py" if self.server else "transcribe_mlx.py"
+            cmd = [python, os.path.join(BASE_DIR, script), audio, "--overwrite"]
+            if job.get("model"):
+                cmd += ["--model", job["model"]]
             return cmd
         cmd = [python, os.path.join(BASE_DIR, "diarize_local.py"), audio, "--overwrite"]
-        if self.job.get("speakers"):
-            cmd += ["--speakers", str(self.job["speakers"])]
+        if job.get("speakers"):
+            cmd += ["--speakers", str(job["speakers"])]
         return cmd
 
-    def _spawn(self, cmd):
+    def _spawn(self, job, cmd):
         proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in proc.stdout:
@@ -722,29 +868,123 @@ class JobRunner:
             noise = ("Warning:" in line or line.startswith(("Fetching ", "  ", "\t"))
                      or "warnings.warn" in line or line.startswith("/"))
             if line and not noise:
+                # --server では、サーバーの中のパスを画面に出さない
+                if self.server:
+                    line = line.replace(os.path.dirname(job["audio"]) + os.sep, "")
                 with self.lock:
-                    self.job["log"] = (self.job["log"] + [line])[-40:]
-                    self.job["elapsed"] = round(time.time() - self.job["started"])
+                    job["log"] = (job["log"] + [line])[-40:]
+                    job["elapsed"] = round(time.time() - job["started"])
         return proc.wait()
 
-    def _set(self, **kw):
+    def _set(self, job, **kw):
         with self.lock:
-            self.job.update(kw)
-            self.job["elapsed"] = round(time.time() - self.job["started"])
+            job.update(kw)
+            job["elapsed"] = round(time.time() - job["started"])
 
-    def _stage(self, key, status):
+    def _stage(self, job, key, status):
         with self.lock:
-            for s in self.job["stages"]:
+            for s in job["stages"]:
                 if s["key"] == key:
                     s["status"] = status
-            self.job["elapsed"] = round(time.time() - self.job["started"])
+            job["elapsed"] = round(time.time() - job["started"])
+
+
+class Workspaces:
+    """--server のときの、人ごとの作業場所。
+
+    作業場所は data_root/<推測できない ID>/ のディレクトリで、ブラウザには
+    cookie で覚えてもらう。ID さえ知っていれば別の端末からも開ける
+    （画面に「この作業場所の URL」を出す）。ログインは無い。DNG-LAN の中だけで
+    使う前提で、他人の収録が一覧に出ないことを守る仕組み。
+
+    最後に使ってから keep_days 日たった作業場所は、音声も結果も丸ごと消す。
+    """
+
+    TOUCH_EVERY = 60   # 最後に使った時刻は、1分に1回だけ書けば足りる
+
+    def __init__(self, root, keep_days, replacements_template):
+        self.root = os.path.abspath(root)
+        self.keep_days = keep_days
+        self.template = replacements_template
+        self.touched = {}
+        os.makedirs(self.root, exist_ok=True)
+
+    def path(self, wid):
+        return os.path.join(self.root, wid)
+
+    def exists(self, wid):
+        return bool(wid) and bool(WORKSPACE_RE.match(wid)) and os.path.isdir(self.path(wid))
+
+    def create(self):
+        wid = secrets.token_urlsafe(18)
+        d = self.path(wid)
+        os.makedirs(d)
+        # 置換辞書は作業場所ごと。ほかの人の固有名詞が混ざらないように
+        dst = os.path.join(d, "replacements.json")
+        if os.path.exists(self.template):
+            shutil.copyfile(self.template, dst)
+        self.touch(wid, force=True)
+        return wid
+
+    def store(self, wid):
+        d = self.path(wid)
+        return Store(d, os.path.join(d, "replacements.json"))
+
+    def touch(self, wid, force=False):
+        now = time.time()
+        if not force and now - self.touched.get(wid, 0) < self.TOUCH_EVERY:
+            return
+        self.touched[wid] = now
+        mark = os.path.join(self.path(wid), ".last-used")
+        try:
+            with open(mark, "w") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S\n"))
+        except OSError:
+            pass
+
+    def last_used(self, wid):
+        mark = os.path.join(self.path(wid), ".last-used")
+        try:
+            return os.path.getmtime(mark)
+        except OSError:
+            return os.path.getmtime(self.path(wid))
+
+    def clean(self, busy):
+        """使われなくなった作業場所を消す。処理中・順番待ちのものは消さない。"""
+        limit = time.time() - self.keep_days * 86400
+        removed = []
+        for wid in os.listdir(self.root):
+            if not WORKSPACE_RE.match(wid) or wid in busy:
+                continue
+            if not os.path.isdir(self.path(wid)):
+                continue
+            if self.last_used(wid) < limit:
+                shutil.rmtree(self.path(wid), ignore_errors=True)
+                self.touched.pop(wid, None)
+                removed.append(wid)
+        return removed
+
+    def run_cleaner(self, jobs, every=3600):
+        def loop():
+            while True:
+                try:
+                    for wid in self.clean(jobs.active_keys()):
+                        jobs.forget(wid)
+                        print("作業場所を消しました（%d日使われていない）: %s…"
+                              % (self.keep_days, wid[:6]), flush=True)
+                except Exception as e:
+                    print("作業場所の掃除に失敗しました:", e, flush=True)
+                time.sleep(every)
+        threading.Thread(target=loop, daemon=True).start()
 
 
 class Handler(BaseHTTPRequestHandler):
-    store = None       # サーバー起動時に注入
+    store = None       # サーバー起動時に注入（手元で使うとき）
     jobs = None        # JobRunner
     caps = {}          # この環境でできること
     source_dir = ""    # 「ファイルを追加」で最初に開くディレクトリ
+    workspaces = None  # --server のときの Workspaces
+    max_upload = 0     # --server のときのアップロードの上限（バイト）
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -756,6 +996,48 @@ class Handler(BaseHTTPRequestHandler):
             super().handle()
         except (ConnectionResetError, BrokenPipeError):
             pass
+
+    # --- 作業場所 ----------------------------------------------------
+    def _bind(self, path, qs):
+        """このリクエストで使う Store と作業場所を決める。
+
+        手元で使うときは起動時の Store ひとつ。--server のときは cookie の
+        作業場所。ページ（/）を開いたときだけ、無ければ作り、?ws= が付いて
+        いればそれに切り替える。API を作業場所なしで呼ばれたら断る。
+        返り値は False のとき、もう応答を返したという意味。
+        """
+        self.wid = ""
+        self.set_cookie = None
+        if not self.workspaces:
+            self.st = self.store
+            return True
+        ws = self.workspaces
+        wid = self._cookie("ws")
+        if path in ("/", "/index.html"):
+            asked = (qs.get("ws") or [""])[0]
+            if asked and ws.exists(asked):
+                wid = asked
+                self.set_cookie = wid
+            elif not ws.exists(wid):
+                wid = ws.create()
+                self.set_cookie = wid
+        if not ws.exists(wid):
+            if path.startswith("/api/") or path == "/audio":
+                self._send_json({"error": "no_workspace"}, 403)
+                return False
+            self.st = None        # 静的ファイルだけ
+            return True
+        self.wid = wid
+        self.st = ws.store(wid)
+        ws.touch(wid)
+        return True
+
+    def _cookie(self, key):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == key:
+                return v
+        return ""
 
     # --- 送信ヘルパ --------------------------------------------------
     def _send_json(self, obj, status=200):
@@ -796,14 +1078,34 @@ class Handler(BaseHTTPRequestHandler):
         with open(path, "rb") as f:
             body = f.read()
         ext = os.path.splitext(path)[1].lower()
-        self._send_bytes(body, MIME.get(ext, "application/octet-stream"))
+        extra = {}
+        if self.set_cookie:
+            # 1年覚えておく。消えるのは作業場所のほう（keep_days）
+            extra["Set-Cookie"] = ("ws=%s; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly"
+                                   % self.set_cookie)
+        if self.workspaces and ext == ".html":
+            extra["Cache-Control"] = "no-store"
+        self._send_bytes(body, MIME.get(ext, "application/octet-stream"), extra=extra)
+
+    # --- 成果物を落とす（--server）------------------------------------
+    def _serve_download(self, name, kind):
+        path = self.st.download_path(name, kind)
+        if not path:
+            self._send_json({"error": "not found"}, 404)
+            return
+        with open(path, "rb") as f:
+            body = f.read()
+        fn = os.path.basename(path)
+        quoted = urllib.parse.quote(fn)
+        self._send_bytes(body, "text/plain; charset=utf-8", extra={
+            "Content-Disposition": "attachment; filename=\"download.txt\"; filename*=UTF-8''%s" % quoted})
 
     # --- 音声（Range 対応）------------------------------------------
     def _serve_audio(self, name):
-        if not self.store._safe(name):
+        if not self.st._safe(name):
             self._send_bytes(b"Bad name", "text/plain", 400)
             return
-        path = self.store._find_audio(name)
+        path = self.st._find_audio(name)
         if not path:
             self._send_bytes(b"No audio", "text/plain", 404)
             return
@@ -872,44 +1174,58 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+        if not self._bind(path, qs):
+            return
+        server = bool(self.workspaces)
 
         if path == "/api/list":
-            self._send_json({"projects": self.store.list_projects()})
+            self._send_json({"projects": self.st.list_projects()})
         elif path == "/api/replacements":
-            self._send_json({"replacements": self.store.load_replacements(),
-                             "path": self.store.replacements_path})
+            rp = self.st.replacements_path
+            self._send_json({"replacements": self.st.load_replacements(),
+                             "path": os.path.basename(rp) if server else rp})
         elif path == "/api/diarization":
             name = (qs.get("name") or [""])[0]
-            found = self.store.find_diarization(name) if self.store._safe(name) else None
+            found = self.st.find_diarization(name) if self.st._safe(name) else None
             if not found:
                 self._send_json({"found": False})
             else:
-                spans = self.store.load_diarization(found)
+                spans = self.st.load_diarization(found)
                 self._send_json({"found": True, "file": os.path.basename(found),
                                  "spans": len(spans),
                                  "speakers": sorted({sp[2] for sp in spans})})
         elif path == "/api/project":
             name = (qs.get("name") or [""])[0]
-            data = self.store.load_project(name)
+            data = self.st.load_project(name)
             if data is None:
                 self._send_json({"error": "not found"}, 404)
             else:
                 self._send_json(data)
         elif path == "/api/capabilities":
             # モデル一覧はここで読み直す。models.json に足したら再読み込みで増える。
-            self._send_json({"capabilities": self.caps, "source_dir": self.source_dir,
-                             "models": load_models()})
+            body = {"capabilities": self.caps, "models": load_models(self.jobs.model_kind()),
+                    "source_dir": "" if server else self.source_dir}
+            if server:
+                body["workspace"] = {"link": "/?ws=" + self.wid,
+                                     "keep_days": self.workspaces.keep_days,
+                                     "max_upload": self.max_upload}
+            self._send_json(body)
         elif path == "/api/sources":
+            if server:
+                self._send_json({"error": "disabled"}, 403)
+                return
             d = (qs.get("dir") or [self.source_dir])[0]
-            self._send_json(self.store.list_sources(d))
+            self._send_json(self.st.list_sources(d))
         elif path == "/api/artifacts":
             name = (qs.get("name") or [""])[0]
-            if not self.store._safe(name):
+            if not self.st._safe(name):
                 self._send_json({"error": "bad_name"}, 400)
             else:
-                self._send_json({"name": name, "artifacts": self.store.artifacts(name)})
+                self._send_json({"name": name, "artifacts": self.st.artifacts(name)})
         elif path == "/api/job":
-            self._send_json({"job": self.jobs.snapshot()})
+            self._send_json({"job": self.jobs.snapshot(self.wid)})
+        elif path == "/api/download" and server:
+            self._serve_download((qs.get("name") or [""])[0], (qs.get("kind") or [""])[0])
         elif path == "/audio":
             self._serve_audio((qs.get("name") or [""])[0])
         else:
@@ -917,8 +1233,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if not self._bind(parsed.path, qs):
+            return
         if parsed.path == "/audio":
-            qs = urllib.parse.parse_qs(parsed.query)
             self._serve_audio((qs.get("name") or [""])[0])
         else:
             self._serve_static(parsed.path)
@@ -928,13 +1246,33 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
         name = (qs.get("name") or [""])[0]
+        if not self._bind(path, qs):
+            return
+        server = bool(self.workspaces)
 
-        if path == "/api/save":
+        if path == "/api/upload" and server:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length <= 0:
+                self._send_json({"error": "empty"}, 400)
+                return
+            if length > self.max_upload:
+                # 本文を読まずに断るので、接続は閉じる
+                self.close_connection = True
+                self._send_json({"error": "too_large", "max": self.max_upload}, 413)
+                return
+            result = self.st.add_upload((qs.get("file") or [""])[0], self.rfile, length,
+                                        (qs.get("mode") or ["ask"])[0])
+            if result.get("error") in ("bad_name", "bad_type", "exists", "bad_mode"):
+                # 本文を読まずに断ったので、この接続は使い回さない。
+                # 画面は上げる前に同名を確かめて mode を決めるので、ふつうは来ない
+                self.close_connection = True
+            self._send_json({"ok": not result.get("error"), **result})
+        elif path == "/api/save":
             data = self._read_body()
-            ok = self.store.save_project(name, data)
+            ok = self.st.save_project(name, data)
             self._send_json({"ok": ok})
         elif path == "/api/reset":
-            data = self.store.reset_project(name)
+            data = self.st.reset_project(name)
             if data is None:
                 self._send_json({"error": "not found"}, 404)
             else:
@@ -942,51 +1280,60 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/replacements":
             body = self._read_body()
             items = body.get("replacements") if isinstance(body, dict) else body
-            saved = self.store.save_replacements(items)
+            saved = self.st.save_replacements(items)
             self._send_json({"ok": True, "replacements": saved})
         elif path == "/api/apply-speakers":
             body = self._read_body()
             mapping = body.get("mapping") if isinstance(body, dict) else None
-            result = self.store.apply_speakers(name, mapping)
+            result = self.st.apply_speakers(name, mapping)
             if result is None:
                 self._send_json({"error": "not found"}, 404)
             else:
                 self._send_json({"ok": "error" not in result, **result})
         elif path == "/api/apply-replacements":
-            result = self.store.apply_replacements(name)
+            result = self.st.apply_replacements(name)
             if result is None:
                 self._send_json({"error": "not found"}, 404)
             else:
                 self._send_json({"ok": True, **result})
         elif path == "/api/export":
-            result = self.store.export_project(name)
+            result = self.st.export_project(name)
             if result is None:
                 self._send_json({"error": "not found"}, 404)
             else:
+                if server:
+                    result["path"] = os.path.basename(result["path"])
                 self._send_json({"ok": True, **result})
         elif path == "/api/add-source":
+            if server:
+                self._send_json({"error": "disabled"}, 403)
+                return
             body = self._read_body() or {}
-            result = self.store.add_source(body.get("dir") or self.source_dir,
-                                           body.get("file") or "",
-                                           body.get("mode") or "ask")
+            result = self.st.add_source(body.get("dir") or self.source_dir,
+                                        body.get("file") or "",
+                                        body.get("mode") or "ask")
             self._send_json({"ok": not result.get("error"), **result})
         elif path == "/api/job":
             body = self._read_body() or {}
             do_t = bool(body.get("transcribe"))
             do_d = bool(body.get("diarize"))
             # 入っていないものは走らせない。押してから失敗するのを避ける。
-            if do_t and not self.caps.get("transcribe_mlx"):
+            if do_t and not self.caps.get("transcribe"):
                 self._send_json({"error": "no_transcriber"}, 400)
                 return
             if do_d and not self.caps.get("diarize"):
                 self._send_json({"error": "no_diarizer"}, 400)
                 return
             model = body.get("model") or None
-            if model and model not in [m["model"] for m in load_models()]:
+            if model and model not in [m["model"] for m in load_models(self.jobs.model_kind())]:
                 self._send_json({"error": "unknown_model", "model": model}, 400)
                 return
-            result = self.jobs.start(body.get("name") or name, do_t, do_d,
-                                     body.get("speakers"), model) or {}
+            target = body.get("name") or name
+            if not self.st._safe(target):
+                self._send_json({"error": "bad_name"}, 400)
+                return
+            result = self.jobs.start(self.st, target, do_t, do_d,
+                                     body.get("speakers"), model, key=self.wid) or {}
             self._send_json({"ok": not result.get("error"), **result})
         else:
             self._send_json({"error": "unknown"}, 404)
@@ -1002,23 +1349,45 @@ def main():
                         help="置換辞書のJSON（既定: リポジトリ直下の replacements.json）")
     parser.add_argument("--source-dir", default=os.path.expanduser("~"),
                         help="「ファイルを追加」で最初に開くディレクトリ")
+    server_opts = parser.add_argument_group("研究室のサーバーで共有する（--server）")
+    server_opts.add_argument("--server", action="store_true",
+                             help="人ごとに作業場所を分け、音声はブラウザから上げてもらう。"
+                                  "サーバーの中のフォルダは見せない")
+    server_opts.add_argument("--data-root", default=os.path.join(BASE_DIR, "workspaces"),
+                             help="作業場所を置くディレクトリ（--server のとき。--dir の代わり）")
+    server_opts.add_argument("--keep-days", type=float, default=7,
+                             help="最後に使ってからこの日数で作業場所を消す（既定: 7）")
+    server_opts.add_argument("--max-upload-mb", type=int, default=4096,
+                             help="アップロードできる1ファイルの上限（MB・既定: 4096）")
+    parser.add_argument("--worker-python", default=sys.executable,
+                        help="文字起こし・話者分離を走らせる Python（既定: このプロセスと同じ）")
     args = parser.parse_args()
 
-    Handler.store = Store(args.dir, args.replacements)
-    Handler.jobs = JobRunner(Handler.store)
-    Handler.caps = capabilities()
-    Handler.source_dir = os.path.abspath(os.path.expanduser(args.source_dir))
+    Handler.caps = capabilities(args.worker_python, server=args.server)
+    Handler.jobs = JobRunner(args.worker_python, server=args.server)
+    if args.server:
+        Handler.workspaces = Workspaces(args.data_root, args.keep_days, DEFAULT_REPLACEMENTS)
+        Handler.max_upload = args.max_upload_mb * 1024 * 1024
+        Handler.workspaces.run_cleaner(Handler.jobs)
+    else:
+        Handler.store = Store(args.dir, args.replacements)
+        Handler.source_dir = os.path.abspath(os.path.expanduser(args.source_dir))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.daemon_threads = True
     url = "http://%s:%d/" % (args.host, args.port)
     print("アノテーターを起動しました:", url)
-    print("対象ディレクトリ:", Handler.store.data_dir)
-    print("置換辞書:", Handler.store.replacements_path,
-          "(%d件)" % len(Handler.store.load_replacements()))
+    if args.server:
+        print("サーバーモード: 作業場所", Handler.workspaces.root,
+              "／ 最後に使ってから %g 日で消す" % args.keep_days)
+    else:
+        print("対象ディレクトリ:", Handler.store.data_dir)
+        print("置換辞書:", Handler.store.replacements_path,
+              "(%d件)" % len(Handler.store.load_replacements()))
     # 文字起こしと話者分離は「あれば使う」。無くてもアノテーターは動く。
-    ready = [k for k, v in Handler.caps.items() if v and k != "ffprobe"]
+    ready = [k for k in ("transcribe", "diarize") if Handler.caps.get(k)]
     print("この環境でできること:", "／".join(ready) if ready
-          else "アノテーションのみ（文字起こし・話者分離のツールは未導入）")
-    print("停止するには Ctrl+C")
+          else "アノテーションのみ（文字起こし・話者分離のツールは未導入）", flush=True)
+    print("停止するには Ctrl+C", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

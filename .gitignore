@@ -222,3 +222,6 @@ __marimo__/
 recordings/
 model/
 
+
+# --server の作業場所（人の音声が入る）
+workspaces/
