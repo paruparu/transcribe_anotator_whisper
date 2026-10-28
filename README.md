@@ -61,6 +61,7 @@ python annotator.py --source-dir ~/Documents/録音   # よく音声を置く場
 | 作業を他の人に引き継ぐ | [別の端末に渡して続きをやってもらう](#別の端末に渡して続きをやってもらう) |
 | 文字起こしは使わず注釈だけ | [アノテーションだけで使う](#アノテーションだけで使う) |
 | 研究室の GPU 機でみんなに使ってもらう | [研究室のサーバーで共有する](#研究室のサーバーで共有する--server) |
+| ほかのアプリから音声を投げて文字起こしする | [HTTP で呼ぶ（Docker・suzume-pgx）](#http-で呼ぶdockersuzume-pgx) |
 | うまくいかない | [困ったとき](#困ったとき) |
 
 ---
@@ -678,6 +679,46 @@ python annotator.py --server --host 0.0.0.0 --port 28630 \
 - アップロードの上限は `--max-upload-mb`（既定 4096）
 - 文字起こしのモデルは `models.json` の `transcribe_cuda` に並べたものから選びます。
   初期プロンプトは句読点入りの文で、書き方を誘導しています（`transcribe_cuda.py` の説明を参照）
+
+## HTTP で呼ぶ（Docker・suzume-pgx）
+
+画面を使わず、**ほかのアプリ（patch-gm-kit など）から音声を1本投げて、話者つきの文字起こしを JSON で受け取る**ための口です。
+中身は `--server` と同じです（`transcribe_cuda.py` の設定の faster-whisper large-v3 → `diarize_local.py` の pyannote → 単語ごとに話者を付けて行で多数決）。
+`stt_server.py` がサーバー、`docker/` がイメージです。
+
+```bash
+curl -s --data-binary @talk.m4a "http://192.168.98.253:28640/transcribe?name=talk.m4a&speakers=3"
+python3 docker/check-stt.py talk.m4a --url http://192.168.98.253:28640 --speakers 3   # 動作確認
+```
+
+| | |
+|---|---|
+| `GET /health` | 生きているか・モデルを読み込み済みか・処理中か |
+| `POST /transcribe` | 本文に音声そのもの。クエリは `name`（拡張子で形式を見分ける）・`speakers`・`diarize=0`・`language`・`prompt` |
+
+返り値は `text`（`(SPEAKER_00) …` の行）・`segments`（行ごとの時刻と話者）・`words`・`speakers`・`took`（かかった秒）。
+
+- **一度に1本ずつ**処理します。音声は処理中だけ一時ファイルに置き、終わったら消します（残しません）
+- モデルは最初の依頼で読み込み、**10分使われなければ手放します**（`--idle-unload`）。pgx は LM Studio とメモリを分け合っているため（読み込むと約6GB 増える）
+- `~/.config/stt-server/token` に文字列を置いて入れ直すと、`Authorization: Bearer <それ>` の無い依頼を断ります。今は認証なし（DNG-LAN の中だけ）
+
+### suzume-pgx に載せる
+
+```bash
+rsync -a --relative .dockerignore transcribe_cuda.py diarize_local.py stt_server.py docker/ suzume-pgx:stt-server/
+ssh suzume-pgx 'cd ~/stt-server && bash docker/run-pgx.sh'      # 作り直して起動（restart=unless-stopped）
+```
+
+- 長いビルド（初回の CTranslate2 で約5分）は `tmux new-session -d -s stt-build "docker build …"` で回す
+- モデルは `~/.cache/stt-server/hf` に残ります。話者分離のモデルはゲート付きですが、ここにキャッシュがあればトークンなしで読めます
+- 実測（2026-10-28・26秒の2人の会話）：初回 15.8秒（モデルの読み込み込み）、2回目以降 **3.1秒**（文字起こし 2.3秒・話者分離 0.8秒）
+
+**aarch64（DGX Spark・GB10）で動かすための要点**（Dockerfile のコメントにも書いてある）:
+
+- **CTranslate2 はソースからビルドする。**PyPI の aarch64 版は CPU 専用。GB10 は sm_121 で、CMake 3.28 の FindCUDA は「12.1」を読めない（`Unknown CUDA Architecture Name 12.1`）ので、`-gencode` を直接指定する
+- torch は公式の `2.8.0+cu129`（aarch64）。12.0 までの対応という警告は出るが動く
+- torchcodec は torch 2.8 に合う aarch64 版が無いので入れず、音声は波形にしてから pyannote に渡す
+- **`av` は 17.1.0 に固定。**19.x だと faster-whisper 1.2.1 が `metadata_errors` で落ちる。numpy・onnxruntime・huggingface_hub も nina と同じ版に固定してある
 
 ## 困ったとき
 

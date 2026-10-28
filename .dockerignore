@@ -1,0 +1,5 @@
+# イメージに入れるのは Dockerfile が COPY する .py だけ。音声・モデル・作業場所は入れない
+*
+!transcribe_cuda.py
+!diarize_local.py
+!stt_server.py
